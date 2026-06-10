@@ -27,7 +27,7 @@ export all_frequencies, triv
 export analytic_integral,
        analytic_double_integral,
        all_commutators_Fourier,
-       FM_step_2nd!,
+       FM_step_1st!, FM_step_2nd!, FM_step_combined!,
        FM_U,
        compute_Floquet,
        FMTE, FMTE_1st, FMTE_2nd

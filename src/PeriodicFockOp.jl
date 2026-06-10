@@ -105,7 +105,7 @@ function Fourier_op(O::PeriodicFockMatrix; N::Int=200, tol::Float64=1e-2)
         end
 
         fourier_f = fftshift(fft(fvals)) / N
-        freqs = collect(div(-N,2):div(N,2))
+        freqs = collect(div(-N,2):div(N-1,2))
         maxf = maximum(abs.(fourier_f))
         mask = abs.(fourier_f) .> tol*maxf
 

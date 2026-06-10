@@ -4,6 +4,7 @@
 using Revise
 using FoSpFloquet
 using LinearAlgebra
+using Plots
 
 # Define space 
 L = 5
@@ -32,53 +33,27 @@ end
 ω = 14.
 K = 2.4 * ω
 T = 2π/ω
-f_t(t) = K * cos(ω * t )
 
-# convert to relevant Operators
-H_t = PeriodicFockOperator([H_j+ H_u, V_drive], [triv, f_t], T)
-H_fourier = Fourier_op(H_t)
-H_fourier_m = matrix_rep(H_fourier, states)
 
-# Storage
-U1s = []
-U2s = []
+amount = 20
+Ks = LinRange(0, 3*ω, amount)
+Ks
+ϵs = zeros(Float64, length(states), amount)
+for (i,k) in enumerate(Ks)
+    f_t(t) = k * cos(ω * t)
+    H_t = PeriodicFockOperator([H_j+ H_u, V_drive], [triv, f_t], T)
+    H_fourier = Fourier_op(H_t)
+    H_fourier_m = matrix_rep(H_fourier, states)
 
-# Tolerances
-tols = [1/10^i for i in 3:4]
-
-for tol in tols
-    U1, _ = compute_Floquet(H_fourier_m, 0., 1; tol=tol)
-    push!(U1s, U1)
-    
-    U2, _ = compute_Floquet(H_fourier_m, 0., 2; tol=tol)
-    push!(U2s, U2)
-end
-U2s[end]' * U2s[end]
-# Check convergence by differences
-println("Convergence for U1:")
-for i in 2:length(U1s)
-    println("ΔU1 (tol $(tols[i])) = ", norm(U1s[i] - U1s[i-1]))
+    U_fl,_ = compute_Floquet(H_fourier_m, 0.; tol=1e-5)
+    ϵ, vs = eigen(U_fl)
+    ϵs[:,i] = sort(real.(-1im .* log.(ϵ) ./ T))
 end
 
-println("Convergence for U2:")
-for i in 2:length(U2s)
-    println("ΔU2 (tol $(tols[i])) = ", norm(U2s[i] - U2s[i-1]))
+pl_es = plot(;legend=false);
+for i in 1:length(states)
+    scatter!(pl_es, Ks / ω, ϵs[i, :], color=:red, markersize=1)
 end
+display(pl_es)
 
-# Identity matrix
-I1 = Matrix{ComplexF64}(I, size(U1s[1])...)
-I2 = Matrix{ComplexF64}(I, size(U2s[1])...)
 
-println("Convergence for U1 (unitary norm):")
-for i in 2:length(U1s)
-    err_unitary = norm(U1s[i]' * U1s[i-1] - I1, Inf)
-    println("tol=$(tols[i]): err_unitary = $err_unitary")
-end
-
-println("Convergence for U2 (unitary norm):")
-for i in 2:length(U2s)
-    err_unitary = norm(U2s[i]' * U2s[i-1] - I2, Inf)
-    println("tol=$(tols[i]): err_unitary = $err_unitary")
-end
-H_fourier_m(0.) - H_fourier_m(0.)'
-U' 

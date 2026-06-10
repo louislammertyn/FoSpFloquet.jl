@@ -49,11 +49,18 @@ function all_commutators_Fourier(H::FourierFockMatrix)
     return Commutators
 end
 
+function integrals_freq_to_index(n::Int)
+    α = n>=0 ? 1 : 0
+    return (2*abs(n)+α)
+end
+for i in -10:10 
+    println(integrals_freq_to_index(i))
+end
 function FM_step_1st!(
     H::FourierFockMatrix, frequencies::Vector{Int}, U::Matrix{ComplexF64}, t::Float64, dt::Float64,
-    cache::Tuple{Matrix{ComplexF64},Matrix{ComplexF64},Dict{Int, ComplexF64}})
+    cache::Tuple{Matrix{ComplexF64},Matrix{ComplexF64},Matrix{ComplexF64},Dict{Int, ComplexF64}})
 
-    dΩ, tmp, integrals_single = cache
+    dΩ, exp_dΩ, tmp, integrals_single = cache
 
     # integrals
     for n in frequencies
@@ -69,8 +76,8 @@ function FM_step_1st!(
         end
     end
 
-   
-    mul!(tmp, exp(-1im * dΩ), U)
+    exp_dΩ .= exp(-1im * dΩ)
+    mul!(tmp, exp_dΩ, U)
     U .= tmp
 
 end
@@ -81,11 +88,12 @@ function FM_step_2nd!(
     cache::Tuple{
         Matrix{ComplexF64},
         Matrix{ComplexF64},
+        Matrix{ComplexF64},
         Dict{Int, ComplexF64},
         Dict{Tuple{Int, Int}, ComplexF64}
     }
 )
-    dΩ, tmp, integrals_single, integrals_double = cache
+    dΩ, exp_dΩ, tmp, integrals_single, integrals_double = cache
 
     # integrals
     for n in frequencies
@@ -107,17 +115,66 @@ function FM_step_2nd!(
 
     # second order sum 
     for ((n,m), M) in comms
-        axpy!(integrals_double[(n,m)], M, dΩ)
-        axpy!(-1. * integrals_double[(m,n)], M, dΩ)
+        axpy!(integrals_double[(n,m)] - integrals_double[(m,n)], M, dΩ)
     end
 
     #add to U
-    mul!(tmp, exp(-1im *dΩ), U)
+    exp_dΩ .=exp(-1im *dΩ)
+    mul!(tmp, exp_dΩ, U)
     U .= tmp
 end
 
+function FM_step_combined!(
+    H::FourierFockMatrix, frequencies::Vector{Int}, 
+    comms::Vector{Tuple{Tuple{Int, Int}, Matrix{ComplexF64}}},
+    U1::Matrix{ComplexF64}, U2::Matrix{ComplexF64},
+    t::Float64, dt::Float64,
+    cache::Tuple{
+        Matrix{ComplexF64}, Matrix{ComplexF64}, Matrix{ComplexF64},  # for 1st order: dΩ1, exp_dΩ1, tmp1
+        Matrix{ComplexF64}, Matrix{ComplexF64}, Matrix{ComplexF64},  # for 2nd order: dΩ2, exp_dΩ2, tmp2
+        Dict{Int, ComplexF64},
+        Dict{Tuple{Int, Int}, ComplexF64}
+    }
+)
+    dΩ1, exp_dΩ1, tmp1, dΩ2, exp_dΩ2, tmp2, integrals_single, integrals_double = cache
+
+    # Compute single integrals once, shared by both orders
+    for n in frequencies
+        integrals_single[n] = analytic_integral(t, dt, n, H.ω)
+    end
+
+    # Compute double integrals for 2nd order
+    for n in frequencies, m in frequencies
+        integrals_double[(n,m)] = analytic_double_integral(t, dt, n, m, H.ω)
+    end
+
+    # Build first-order dΩ (shared first-order sum)
+    fill!(dΩ1, zero(ComplexF64))
+    for h in H.terms
+        for (i, n) in enumerate(h.freqs)
+            axpy!(integrals_single[n] * h.coeffs[i], h.op, dΩ1)
+        end
+    end
+
+    # Build second-order dΩ by starting from the first-order sum
+    dΩ2 .= dΩ1
+    for ((n,m), M) in comms
+        axpy!(integrals_double[(n,m)] - integrals_double[(m,n)], M, dΩ2)
+    end
+
+    # Apply to U1 (1st order)
+    exp_dΩ1 .= exp(-1im * dΩ1)
+    mul!(tmp1, exp_dΩ1, U1)
+    U1 .= tmp1
+
+    # Apply to U2 (2nd order)
+    exp_dΩ2 .= exp(-1im * dΩ2)
+    mul!(tmp2, exp_dΩ2, U2)
+    U2 .= tmp2
+end
+
 # Fourier-Magnus time evolution (FMTE) over arbitrary interval for first order Magnus expanison per timestep
-function FMTE_1st(H::FourierFockMatrix, t_i::Float64, t_e::Float64, tol::Float64=1e-9, comms=Vector{Tuple{Tuple{Int, Int}, Matrix{ComplexF64}}}())
+function FMTE_1st(H::FourierFockMatrix, t_i::Float64, t_e::Float64, tol::Float64=1e-2, comms=Vector{Tuple{Tuple{Int, Int}, Matrix{ComplexF64}}}())
     # Initialize identity matrix
     U = Matrix{ComplexF64}(I, size(first(H.terms).op)...)
 
@@ -125,10 +182,10 @@ function FMTE_1st(H::FourierFockMatrix, t_i::Float64, t_e::Float64, tol::Float64
     freqs = all_frequencies(H)
 
     # Cache for Magnus steps
-    dΩ = similar(U)
+    dΩ = similar(U); exp_dΩ = similar(U); tmp = similar(U)
     integrals_single = Dict{Int, ComplexF64}()
-    tmp = similar(U)
-    cache = (dΩ, tmp, integrals_single)
+    
+    cache = (dΩ, exp_dΩ, tmp, integrals_single)
 
     t = t_i
     dt = 0.01 * (2π / H.ω)  # initial timestep
@@ -138,20 +195,20 @@ function FMTE_1st(H::FourierFockMatrix, t_i::Float64, t_e::Float64, tol::Float64
     steps = 0
     t_start = time()
 
+    U_temp = copy(U)
     while t < t_e
 
         # Compute first-order Magnus increment
-        FM_step_1st!(H, freqs, U, t, dt, cache)  # see below
+        FM_step_1st!(H, freqs, U_temp, t, dt, cache)  # see below
 
         # Compute error = norm of Magnus increment
-        Ω = copy(cache[1])  # dU from FM_step_1st!
-        err = norm(Ω, Inf) / norm(U)
+        err = norm(dΩ, Inf) 
 
         if err < tol
             # Accept step
             t += dt
             steps += 1
-
+            U .= U_temp
             # Grow timestep if error is much smaller than tolerance
             if err < 0.2*tol
                 dt *= 1.1
@@ -161,6 +218,7 @@ function FMTE_1st(H::FourierFockMatrix, t_i::Float64, t_e::Float64, tol::Float64
             # Shrink timestep
             dt *= 0.8 * (tol / err)^(1/2)
             dt = max(dt, dt_min)
+            U_temp .= U
             continue  # redo step with smaller dt
         end
     end
@@ -172,7 +230,7 @@ end
 
 
 # Fourier-Magnus time evolution (FMTE) over arbitrary interval 
-function FMTE_2nd(H::FourierFockMatrix, t_i::Float64, t_e::Float64, tol::Float64=1e-9, comms=Vector{Tuple{Tuple{Int, Int}, Matrix{ComplexF64}}}()) 
+function FMTE_2nd(H::FourierFockMatrix, t_i::Float64, t_e::Float64, tol::Float64=1e-2, comms=Vector{Tuple{Tuple{Int, Int}, Matrix{ComplexF64}}}()) 
     U = Matrix{ComplexF64}(I, size(first(H.terms))...)  # initialize identity matrix
 
     # Precompute frequencies and commutators
@@ -182,28 +240,29 @@ function FMTE_2nd(H::FourierFockMatrix, t_i::Float64, t_e::Float64, tol::Float64
     end
 
     # Cache for Magnus steps
-    dU = similar(U)
-    tmp = similar(U)
+    dΩ = similar(U); exp_dΩ = similar(U); tmp = similar(U)
     ints_single = Dict(k => zero(ComplexF64) for k in freqs)
     ints_double = Dict((n,m) => zero(ComplexF64) for n in freqs, m in freqs)
-    cache = (dU, tmp, ints_single, ints_double)
+    cache = (dΩ, exp_dΩ, tmp, ints_single, ints_double)
 
     t = t_i
     dt = 0.01 * 2*π /  H.ω  # initial timestep
 
     steps = 0
     t1 = time()
+    U_temp = copy(U)
     while t < t_e
         
         # 2nd-order Magnus step (full and two half-steps)
-        FM_step_2nd!(H, freqs, comms, U, t, dt, cache)
+        FM_step_2nd!(H, freqs, comms, U_temp, t, dt, cache)
 
         # Estimate error
-        err = norm(dU) / norm(U)
+        err = norm(dΩ, Inf) 
 
         if err < tol
             t += dt
             steps += 1
+            U .= U_temp
             
             # Increase timestep for next iteration if error is much smaller than tol
             if err < 0.1*tol
@@ -212,8 +271,9 @@ function FMTE_2nd(H::FourierFockMatrix, t_i::Float64, t_e::Float64, tol::Float64
             end
         else
             # Shrink timestep
-            dt *= 0.9 * (tol / err)^(1/2)
+            dt *= 0.9 * (tol / err)^(1/3)
             dt = max(dt, 1e-12)  # min allowed
+            U_temp .= U
         end
         
     end
@@ -222,7 +282,62 @@ function FMTE_2nd(H::FourierFockMatrix, t_i::Float64, t_e::Float64, tol::Float64
     return U, comms
 end
 
-function FMTE(H::FourierFockMatrix, t_i::Float64, t_e::Float64, order::Integer, tol::Float64=1e-9, comms=Vector{Tuple{Tuple{Int, Int}, Matrix{ComplexF64}}}())
+function FMTE(H::FourierFockMatrix, t_i::Float64, t_e::Float64, tol::Float64=1e-4, comms=Vector{Tuple{Tuple{Int, Int}, Matrix{ComplexF64}}}())
+    U = Matrix{ComplexF64}(I, size(first(H.terms).op)...)
+
+    # Precompute frequencies and commutators
+    freqs = all_frequencies(H)
+    if isempty(comms)
+        comms = all_commutators_Fourier(H)
+    end
+
+    # Caches for both orders
+    dΩ1 = similar(U); exp_dΩ1 = similar(U); tmp1 = similar(U)
+    dΩ2 = similar(U); exp_dΩ2 = similar(U); tmp2 = similar(U)
+    ints_single = Dict(k => zero(ComplexF64) for k in freqs)
+    ints_double = Dict((n,m) => zero(ComplexF64) for n in freqs, m in freqs)
+    cache = (dΩ1, exp_dΩ1, tmp1, dΩ2, exp_dΩ2, tmp2, ints_single, ints_double)
+
+    t      = t_i
+    dt     = 0.01 * (2π / H.ω)
+    dt_min = 1e-12
+    dt_max = 0.1  * (2π / H.ω)
+
+    U1_temp = copy(U)
+    U2_temp = copy(U)
+    steps   = 0
+    t_start = time()
+
+    while t < t_e
+        dt = min(dt, t_e - t)   # don't overshoot
+
+        # Take a step with each order (both start from the same U)
+        U1_temp .= U
+        U2_temp .= U
+        FM_step_combined!(H, freqs,  comms, U1_temp, U2_temp, t, dt, cache)
+
+        # Error estimate: difference between the two propagators
+        err = norm(U2_temp .- U1_temp, Inf)
+
+        if err < tol
+            t     += dt
+            steps += 1
+            U .= U2_temp          # accept the higher-order result
+
+            if err < 0.1 * tol
+                dt = min(dt * 1.2, dt_max)
+            end
+        else
+            # Richardson-style step-size control for a 2nd-order method
+            dt = max(dt * 0.9 * (tol / err)^(1/3), dt_min)
+        end
+    end
+
+    println("Algorithm ran $steps steps in $(round((time()-t_start)/60, digits=2)) mins")
+    return U, comms
+end
+
+function FMTE(H::FourierFockMatrix, t_i::Float64, t_e::Float64, order::Int, tol::Float64=1e-2, comms=Vector{Tuple{Tuple{Int, Int}, Matrix{ComplexF64}}}())
     if order ==1
         return FMTE_1st(H, t_i, t_e, tol), comms
     elseif order == 2
@@ -301,9 +416,14 @@ function FM_U(H::FourierFockMatrix, t_i::Float64, t_e::Float64, tol::Float64=1e-
 end
 
 # Compute Floquet operator in initial time gauge of choice
-function compute_Floquet(H::FourierFockMatrix, t_i::Float64, order=1; tol::Float64=1e-9, comms=Vector{Tuple{Tuple{Int, Int}, Matrix{ComplexF64}}}())
+function compute_Floquet(H::FourierFockMatrix, t_i::Float64, order::Int; tol::Float64=1e-9, comms=Vector{Tuple{Tuple{Int, Int}, Matrix{ComplexF64}}}())
     t_e = t_i + 2*π/H.ω
     return FMTE(H, t_i, t_e, order, tol, comms)
+end
+
+function compute_Floquet(H::FourierFockMatrix, t_i::Float64; tol::Float64=1e-9, comms=Vector{Tuple{Tuple{Int, Int}, Matrix{ComplexF64}}}())
+    t_e = t_i + 2*π/H.ω
+    return FMTE(H, t_i, t_e, tol, comms)
 end
 
 
